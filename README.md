@@ -93,6 +93,22 @@ python -m pip install -e ".[test]"
 python -m pytest
 ```
 
-Diagnostic v2, the production Ozon access layer, and Task 1 Ozon-to-CSV export
-are implemented. Telegram delivery (Task 2), Task 3 cleaning, `run_daily`,
-scheduling, Docker, and a database are intentionally not implemented yet.
+## Task 2: CSV summary to Telegram
+
+Set `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, and optionally
+`LOW_STOCK_THRESHOLD` in the local, uncommitted `.env` file. Then send an
+explicit Task 1 export:
+
+```powershell
+python -m src.task2_summary data/output/ozon_products_2026-09-07.csv
+```
+
+Task 2 reads only the UTF-8-SIG Task 1 CSV, keeps an empty stock value as an
+unknown remainder, builds Russian plain-text product blocks, and splits them at
+product boundaries under Telegram's 4000-character limit. Delivery is
+synchronous with bounded retries for transient Telegram responses. The command
+prints only safe delivery counters; it never prints the bot token or chat ID.
+
+Diagnostic v2, the production Ozon access layer, Task 1 Ozon-to-CSV export, and
+Task 2 CSV-to-Telegram delivery are implemented. Task 3 cleaning, `run_daily`,
+scheduling, Docker, and a database remain intentionally out of scope.

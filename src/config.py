@@ -18,10 +18,21 @@ class OzonConfigError(RuntimeError):
     """Raised when required Ozon configuration is missing."""
 
 
+class TelegramConfigError(RuntimeError):
+    """Raised when required Telegram configuration is invalid or missing."""
+
+
 @dataclass(frozen=True, slots=True)
 class OzonConfig:
     client_id: str
     api_key: str
+
+
+@dataclass(frozen=True, slots=True)
+class TelegramConfig:
+    bot_token: str
+    chat_id: str
+    low_stock_threshold: int
 
 
 def load_ozon_config(
@@ -46,3 +57,41 @@ def load_ozon_config(
         )
 
     return OzonConfig(client_id=client_id, api_key=api_key)
+
+
+def load_telegram_config(
+    dotenv_path: str | PathLike[str] = DEFAULT_DOTENV_PATH,
+) -> TelegramConfig:
+    """Load Telegram settings without exposing credential values."""
+    load_dotenv(dotenv_path)
+
+    bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+    missing = [
+        name
+        for name, value in (
+            ("TELEGRAM_BOT_TOKEN", bot_token),
+            ("TELEGRAM_CHAT_ID", chat_id),
+        )
+        if not value
+    ]
+    if missing:
+        raise TelegramConfigError(
+            "Missing required environment variable(s): " + ", ".join(missing)
+        )
+
+    raw_threshold = os.getenv("LOW_STOCK_THRESHOLD", "5").strip()
+    try:
+        threshold = int(raw_threshold)
+    except ValueError as exc:
+        raise TelegramConfigError(
+            "LOW_STOCK_THRESHOLD must be an integer >= 0"
+        ) from exc
+    if threshold < 0:
+        raise TelegramConfigError("LOW_STOCK_THRESHOLD must be an integer >= 0")
+
+    return TelegramConfig(
+        bot_token=bot_token,
+        chat_id=chat_id,
+        low_stock_threshold=threshold,
+    )
