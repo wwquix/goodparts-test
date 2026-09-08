@@ -1,4 +1,4 @@
-"""Task 3: clean a controlled representative auto-parts catalog safely."""
+"""Task 3: clean the employer-provided auto-parts catalog safely."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ import os
 import re
 import sys
 import tempfile
+from collections import defaultdict
 from collections.abc import Sequence
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
@@ -18,36 +19,35 @@ import pandas as pd
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_INPUT_PATH = PROJECT_ROOT / "data" / "catalog_raw.csv"
 DEFAULT_OUTPUT_PATH = PROJECT_ROOT / "data" / "output" / "catalog_clean.csv"
-SOURCE_COLUMNS = ("description", "price")
-OUTPUT_COLUMNS = ("description", "price", "brand", "oem", "quantity")
-KNOWN_BRANDS = (
-    "BOSCH",
-    "MANN-FILTER",
-    "MAHLE",
-    "SAKURA",
-    "KNECHT",
-    "NGK",
-    "GATES",
-    "SKF",
-    "MOBIL 1",
-    "FILTRON",
-    "VALEO",
-    "ELRING",
+SOURCE_COLUMNS = ("offer_id", "name", "price", "stock")
+OUTPUT_COLUMNS = ("offer_id", "name", "price", "stock", "brand", "oem", "quantity")
+KNOWN_BRANDS = ("Mavico", "DBA", "Деталиус")
+
+_BRAND_BY_NORMALIZED = {brand.casefold(): brand for brand in KNOWN_BRANDS}
+_BRAND_PATTERNS = tuple(
+    (
+        brand,
+        re.compile(
+            rf"(?<!\w){re.escape(brand).replace(r'\ ', r'\s+')}(?!\w)",
+            re.IGNORECASE,
+        ),
+    )
+    for brand in KNOWN_BRANDS
 )
-
-# This controlled representative fixture defines these constrained patterns; it
-# is not employer data or a universal auto-parts parser.
-
-_QUANTITY_PATTERN = re.compile(
-    r"(?:"
-    r"(?P<units>\d+)\s*шт\.?"
-    r"|(?P<pcs>\d+)\s+pcs"
-    r"|комплект\s+(?P<set_after>\d+)"
-    r"|(?P<set_before>\d+)\s+комплект"
-    r")\s*$",
+_PRICE_QUALIFIER = re.compile(r"^от\s+", re.IGNORECASE)
+_PRICE_SUFFIX = re.compile(r"\s*(?:руб\.?|р|rub)\s*$", re.IGNORECASE)
+_GROUPED_PRICE = re.compile(r"\d{1,3}(?:\s\d{3})+(?:[.,]\d{1,2})?")
+_SIMPLE_PRICE = re.compile(r"\d+(?:[.,]\d{1,2})?")
+_OEM_PATTERN = re.compile(
+    r"(?<!\w)OEM\s+(?P<code>\d{10}|\d{4}-\d{7})(?![\w-])",
     re.IGNORECASE,
 )
-_OEM_MARKER = re.compile(r"(?<!\w)OEM(?!\w)", re.IGNORECASE)
+_QUANTITY_PATTERNS = (
+    re.compile(r"(?:набор\s+)?(?P<count>\d+)\s*шт\.?\s*$", re.IGNORECASE),
+    re.compile(r"(?P<count>\d+)\s*(?:комплект|компл\.?|к-т)\.?\s*$", re.IGNORECASE),
+    re.compile(r"(?:комплект|компл\.?|к-т)\s*(?P<count>\d+)\s*$", re.IGNORECASE),
+)
+_PAIR_PATTERN = re.compile(r"(?<!\w)пара\.?\s*$", re.IGNORECASE)
 
 
 class CatalogCleaningError(ValueError):
@@ -99,30 +99,25 @@ def _normalize_price_source(raw: object) -> str:
 
 
 def parse_price(raw: object) -> Decimal | None:
-    """Parse a documented catalog price without using binary floating point."""
+    """Parse only the price spellings observed in the employer CSV.
+
+    ``от`` means a lower bound in the source. The required output schema has no
+    qualifier column, so its numeric lower bound is emitted as the price.
+    """
     text = _as_text(raw)
     if text is None:
         return None
-    text = _collapse_whitespace(text)
-    if not text or text.casefold() == "по запросу":
-        return None
-
-    numeric = re.sub(r"\s*(?:руб|р|rub)\s*$", "", text, flags=re.IGNORECASE)
-    numeric = numeric.strip()
+    numeric = _collapse_whitespace(text)
     if not numeric:
         return None
-
-    normalized: str
-    if re.fullmatch(r"\d{1,3}(?:\.\d{3})+,\d{1,2}", numeric):
-        # The fixture explicitly documents this European thousands/decimal form.
-        normalized = numeric.replace(".", "").replace(",", ".")
-    elif re.fullmatch(r"\d{1,3}(?: \d{3})+(?:,\d{1,2})?", numeric):
+    numeric = _PRICE_QUALIFIER.sub("", numeric)
+    numeric = _PRICE_SUFFIX.sub("", numeric).strip()
+    if _GROUPED_PRICE.fullmatch(numeric):
         normalized = numeric.replace(" ", "").replace(",", ".")
-    elif re.fullmatch(r"\d+(?:[.,]\d{1,2})?", numeric):
+    elif _SIMPLE_PRICE.fullmatch(numeric):
         normalized = numeric.replace(",", ".")
     else:
         return None
-
     try:
         value = Decimal(normalized)
     except InvalidOperation:
@@ -131,24 +126,15 @@ def parse_price(raw: object) -> Decimal | None:
 
 
 def normalize_brand(raw: object) -> str | None:
-    """Return a canonical known brand label, or ``None`` for an unknown label."""
+    """Return a canonical employer-dataset brand, or ``None`` when unknown."""
     text = _as_text(raw)
     if text is None:
         return None
-    normalized = _collapse_whitespace(text).upper()
-    return normalized if normalized in KNOWN_BRANDS else None
-
-
-def _brand_pattern(brand: str) -> re.Pattern[str]:
-    escaped = re.escape(brand).replace(r"\ ", r"\s+")
-    return re.compile(rf"(?<!\w){escaped}(?!\w)", re.IGNORECASE)
-
-
-_BRAND_PATTERNS = tuple((brand, _brand_pattern(brand)) for brand in KNOWN_BRANDS)
+    return _BRAND_BY_NORMALIZED.get(_collapse_whitespace(text).casefold())
 
 
 def extract_brand(description: object) -> str | None:
-    """Extract one known brand using case-insensitive token boundaries."""
+    """Extract one observed brand with case-insensitive token boundaries."""
     text = _as_text(description)
     if text is None:
         return None
@@ -158,48 +144,28 @@ def extract_brand(description: object) -> str | None:
     return None
 
 
-def _terminal_quantity(description: str) -> tuple[int, int] | None:
-    match = _QUANTITY_PATTERN.search(description)
-    if match is None:
-        return None
-    raw_quantity = next(value for value in match.groupdict().values() if value is not None)
-    return match.start(), int(raw_quantity)
-
-
 def extract_quantity(description: object) -> int | None:
-    """Extract only a documented terminal quantity expression."""
-    text = _as_text(description)
-    if text is None:
-        return None
-    terminal = _terminal_quantity(_collapse_whitespace(text))
-    return terminal[1] if terminal is not None else None
-
-
-def extract_oem(description: object) -> str | None:
-    """Extract a syntactically valid OEM code after an explicit marker."""
+    """Extract only observed terminal package expressions, never dimensions."""
     text = _as_text(description)
     if text is None:
         return None
     normalized = _collapse_whitespace(text)
-    marker = _OEM_MARKER.search(normalized)
-    terminal = _terminal_quantity(normalized)
-    if marker is None:
-        return None
+    if _PAIR_PATTERN.search(normalized):
+        return 2
+    for pattern in _QUANTITY_PATTERNS:
+        match = pattern.search(normalized)
+        if match is not None:
+            return int(match.group("count"))
+    return None
 
-    if terminal is None:
-        candidate = normalized[marker.end() :].strip()
-    elif marker.end() < terminal[0]:
-        candidate = normalized[marker.end() : terminal[0]].strip()
-    else:
+
+def extract_oem(description: object) -> str | None:
+    """Extract only the two high-confidence OEM shapes seen after ``OEM``."""
+    text = _as_text(description)
+    if text is None:
         return None
-    canonical = re.sub(r"[\s.]", "", candidate).upper()
-    if (
-        not canonical
-        or not re.fullmatch(r"[A-Z0-9/-]+", canonical)
-        or not re.search(r"\d", canonical)
-    ):
-        return None
-    return canonical
+    match = _OEM_PATTERN.search(_collapse_whitespace(text))
+    return match.group("code") if match is not None else None
 
 
 def _format_price(price: Decimal | None) -> str:
@@ -252,89 +218,116 @@ def _write_csv_atomically(dataframe: pd.DataFrame, final_path: Path) -> Path:
     return final_path
 
 
+def _canonical_offer_id(raw: str) -> str:
+    return raw.strip()
+
+
+def _business_deduplicate(rows: list[dict[str, str]]) -> tuple[list[dict[str, str]], int]:
+    groups: dict[str, list[int]] = defaultdict(list)
+    for index, row in enumerate(rows):
+        offer_id = _canonical_offer_id(row["offer_id"])
+        if offer_id:
+            groups[offer_id.casefold()].append(index)
+
+    keep = [True] * len(rows)
+    removed = 0
+    for indexes in groups.values():
+        if len(indexes) < 2:
+            continue
+        group = [rows[index] for index in indexes]
+        prices = [parse_price(row["price"]) for row in group]
+        if any(price is None for price in prices) or len(set(prices)) != 1:
+            continue
+        nonempty_stocks = {
+            row["stock"].strip() for row in group if row["stock"].strip()
+        }
+        if len(nonempty_stocks) > 1:
+            continue
+        first = group[0]
+        if not first["stock"].strip() and nonempty_stocks:
+            first["stock"] = next(iter(nonempty_stocks))
+        for index in indexes[1:]:
+            keep[index] = False
+            removed += 1
+    return [row for row, include in zip(rows, keep, strict=True) if include], removed
+
+
 def clean_catalog(
     input_path: str | Path = DEFAULT_INPUT_PATH,
     output_path: str | Path = DEFAULT_OUTPUT_PATH,
 ) -> CleaningResult:
-    """Clean the constrained source catalog and atomically publish its CSV."""
+    """Clean the employer catalog and atomically publish its derived CSV."""
     source = _read_source(Path(input_path))
     input_rows = len(source)
-    seen: set[tuple[str, str]] = set()
-    rows: list[dict[str, str | int]] = []
+    seen: set[tuple[str, ...]] = set()
+    rows: list[dict[str, str]] = []
     removed_empty = 0
     removed_exact_duplicates = 0
-    unparsed_prices = 0
-    missing_brands = 0
-    missing_oem = 0
-    missing_quantity = 0
-
     for raw_row in source.itertuples(index=False, name=None):
-        raw_description = _as_text(raw_row[0]) or ""
-        raw_price = _as_text(raw_row[1]) or ""
-        description = _normalize_description(raw_description)
-        price_source = _normalize_price_source(raw_price)
-        if not description and not price_source:
+        row = {
+            column: (_as_text(value) or "")
+            for column, value in zip(SOURCE_COLUMNS, raw_row, strict=True)
+        }
+        if all(not value.strip() for value in row.values()):
             removed_empty += 1
             continue
-
-        # Duplicates are exact only: conflicting same-OEM rows have no authoritative
-        # winner, so display-equivalent whitespace/case variants must remain too.
-        exact_key = (raw_description, raw_price)
+        exact_key = tuple(row[column] for column in SOURCE_COLUMNS)
         if exact_key in seen:
             removed_exact_duplicates += 1
             continue
         seen.add(exact_key)
+        rows.append(row)
 
-        parsed_price = parse_price(price_source)
-        brand = extract_brand(description)
-        oem = extract_oem(description)
-        quantity = extract_quantity(description)
-        if parsed_price is None:
-            unparsed_prices += 1
-        if brand is None:
-            missing_brands += 1
-        if oem is None:
-            missing_oem += 1
-        if quantity is None:
-            missing_quantity += 1
-        rows.append(
+    rows, business_duplicates_removed = _business_deduplicate(rows)
+    output_rows: list[dict[str, str | int]] = []
+    unparsed_prices = missing_brands = missing_oem = missing_quantity = 0
+    for row in rows:
+        price = parse_price(row["price"])
+        brand = extract_brand(row["name"])
+        oem = extract_oem(row["name"])
+        quantity = extract_quantity(row["name"])
+        unparsed_prices += price is None
+        missing_brands += brand is None
+        missing_oem += oem is None
+        missing_quantity += quantity is None
+        output_rows.append(
             {
-                "description": description,
-                "price": _format_price(parsed_price),
+                "offer_id": _canonical_offer_id(row["offer_id"]),
+                "name": row["name"],
+                "price": _format_price(price),
+                "stock": row["stock"].strip(),
                 "brand": brand or "",
                 "oem": oem or "",
                 "quantity": quantity if quantity is not None else "",
             }
         )
 
-    output = pd.DataFrame(rows, columns=OUTPUT_COLUMNS)
+    output = pd.DataFrame(output_rows, columns=OUTPUT_COLUMNS)
     final_path = _write_csv_atomically(output, Path(output_path))
     return CleaningResult(
         path=final_path,
         input_rows=input_rows,
         removed_empty=removed_empty,
         removed_exact_duplicates=removed_exact_duplicates,
-        business_duplicates_removed=0,
+        business_duplicates_removed=business_duplicates_removed,
         unparsed_prices=unparsed_prices,
         missing_brands=missing_brands,
         missing_oem=missing_oem,
         missing_quantity=missing_quantity,
-        output_rows=len(rows),
+        output_rows=len(output_rows),
     )
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Clean the Task 3 catalog fixture")
+    parser = argparse.ArgumentParser(description="Clean the Task 3 employer catalog")
     parser.add_argument("input_path", nargs="?", default=DEFAULT_INPUT_PATH)
     parser.add_argument("--output", default=DEFAULT_OUTPUT_PATH)
     args = parser.parse_args(argv)
-
     try:
         result = clean_catalog(args.input_path, args.output)
     except (CatalogCleaningError, OSError, UnicodeError, pd.errors.ParserError) as exc:
         print(f"Task 3 cleaning failed: {exc}", file=sys.stderr)
         return 1
-
     try:
         display_path = result.path.relative_to(PROJECT_ROOT)
     except ValueError:
