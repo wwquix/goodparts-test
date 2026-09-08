@@ -13,5 +13,10 @@ dependencies = [
     "python-dotenv>=1.0,<2",
 ]
 
+[project.optional-dependencies]
+test = [
+    "pytest>=8,<10",
+]
+
 [tool.setuptools]
 packages = ["src"]
