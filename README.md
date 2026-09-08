@@ -109,6 +109,43 @@ product boundaries under Telegram's 4000-character limit. Delivery is
 synchronous with bounded retries for transient Telegram responses. The command
 prints only safe delivery counters; it never prints the bot token or chat ID.
 
-Diagnostic v2, the production Ozon access layer, Task 1 Ozon-to-CSV export, and
-Task 2 CSV-to-Telegram delivery are implemented. Task 3 cleaning, `run_daily`,
-scheduling, Docker, and a database remain intentionally out of scope.
+## Task 3: controlled catalog cleaning
+
+Run the catalog cleaner from the project root:
+
+```powershell
+python -m src.task3_clean data/catalog_raw.csv
+```
+
+The input must be a UTF-8-SIG CSV with exactly these columns in this order:
+
+```text
+description,price
+```
+
+The cleaner trims and makes description whitespace readable, removes only fully
+empty rows and exact source duplicates, then writes
+`data/output/catalog_clean.csv` atomically in UTF-8-SIG. It deliberately does
+not merge business duplicates: conflicting rows for the same OEM remain in the
+output. The output columns are:
+
+```text
+description,price,brand,oem,quantity
+```
+
+`1.500,50 руб` is the documented unambiguous European format and becomes
+`1500.50`. OEM is extracted only after an explicit `OEM` marker, uppercasing and
+removing spaces/dots while preserving hyphens and slashes. Quantity is extracted
+only from terminal `шт`, `pcs`, or `комплект` patterns; DOT values, oil grades,
+and liters are not quantities. Business deduplication remains disabled because
+conflicting prices have no authoritative winner.
+
+`data/catalog_raw.csv` is not an original GoodParts or employer-provided
+catalog. No original catalog fixture was included with this assignment; this
+small controlled representative fixture was created to demonstrate the
+requested cleaning pipeline and its documented edge cases.
+
+Diagnostic v2, the production Ozon access layer, Task 1 Ozon-to-CSV export,
+Task 2 CSV-to-Telegram delivery, and Task 3 controlled catalog cleaning are
+implemented. `run_daily`, scheduling, Docker, and a database remain
+intentionally out of scope.
