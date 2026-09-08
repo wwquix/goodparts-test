@@ -17,6 +17,8 @@ DIAGNOSTICS_DIR = PROJECT_ROOT / "data" / "diagnostics"
 BASE_URL = "https://api-seller.ozon.ru"
 REQUEST_TIMEOUT_SECONDS = 20.0
 PAGE_LIMIT = 2
+SAFE_RESPONSE_EXCERPT_LENGTH = 500
+_INVALID_JSON = object()
 
 
 class DiagnosticError(RuntimeError):
@@ -56,6 +58,11 @@ def redact_secrets(text: str, secrets: tuple[str, ...]) -> str:
     return redacted
 
 
+def redact_response_excerpt(text: str, secrets: tuple[str, ...]) -> str:
+    """Redact the complete body before bounding user-facing error output."""
+    return redact_secrets(text, secrets)[:SAFE_RESPONSE_EXCERPT_LENGTH]
+
+
 def ensure_credentials_absent(payload: Any, secrets: tuple[str, ...]) -> None:
     """Refuse to print or save a response if it unexpectedly contains credentials."""
     serialized = json.dumps(payload, ensure_ascii=False)
@@ -73,21 +80,27 @@ def post_json(
     secrets: tuple[str, ...],
 ) -> tuple[int, Any]:
     """Make one diagnostic POST and return its status and unmodified JSON body."""
+    network_error: tuple[str, str] | None = None
+    timed_out = False
     try:
         response = client.post(path, json=payload)
-    except httpx.TimeoutException as exc:
+    except httpx.TimeoutException:
+        timed_out = True
+    except httpx.RequestError as exc:
+        network_error = (type(exc).__name__, redact_secrets(str(exc), secrets))
+
+    if timed_out:
         raise DiagnosticError(
             f"Request to {path} timed out after {REQUEST_TIMEOUT_SECONDS:g} seconds."
-        ) from exc
-    except httpx.RequestError as exc:
-        safe_details = redact_secrets(str(exc), secrets)
+        )
+    if network_error is not None:
+        error_type, safe_details = network_error
         raise DiagnosticError(
-            f"Network error while requesting {path}: "
-            f"{type(exc).__name__}: {safe_details}"
-        ) from exc
+            f"Network error while requesting {path}: {error_type}: {safe_details}"
+        )
 
     if response.is_error:
-        safe_body = redact_secrets(response.text, secrets)
+        safe_body = redact_response_excerpt(response.text, secrets)
         raise DiagnosticError(
             f"HTTP error from {path}: status {response.status_code}\n"
             f"Response body:\n{safe_body}"
@@ -95,12 +108,14 @@ def post_json(
 
     try:
         data = response.json()
-    except ValueError as exc:
-        safe_body = redact_secrets(response.text, secrets)
+    except ValueError:
+        data = _INVALID_JSON
+    if data is _INVALID_JSON:
+        safe_body = redact_response_excerpt(response.text, secrets)
         raise DiagnosticError(
             f"{path} returned HTTP {response.status_code}, but the body is not JSON.\n"
             f"Response body:\n{safe_body}"
-        ) from exc
+        )
 
     ensure_credentials_absent(data, secrets)
     return response.status_code, data

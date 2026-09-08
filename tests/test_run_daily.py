@@ -206,6 +206,25 @@ def test_task_1_failure_never_touches_telegram_and_cli_is_nonzero(
     assert "secret URL" not in captured.err
 
 
+def test_daily_error_does_not_retain_arbitrary_failure_details() -> None:
+    fake_secret = "OZON_TEST_SUPER_SECRET"
+
+    with pytest.raises(DailyRunError) as raised:
+        run_daily(
+            load_ozon=lambda: (_ for _ in ()).throw(RuntimeError(fake_secret)),
+            ozon_client_factory=lambda config: (_ for _ in ()).throw(AssertionError()),
+            exporter=lambda client: (_ for _ in ()).throw(AssertionError()),
+            load_telegram=lambda: (_ for _ in ()).throw(AssertionError()),
+            telegram_client_factory=lambda config: (_ for _ in ()).throw(AssertionError()),
+            summary_sender=lambda path, client, threshold: (_ for _ in ()).throw(AssertionError()),
+        )
+
+    assert fake_secret not in str(raised.value)
+    assert fake_secret not in repr(raised.value)
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+
+
 def test_task_2_failure_keeps_successful_csv_and_cli_is_nonzero(
     temp_dir: Path,
     capsys: pytest.CaptureFixture[str],

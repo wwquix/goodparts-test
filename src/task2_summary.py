@@ -11,13 +11,12 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from datetime import date, datetime
 from os import PathLike
 from pathlib import Path
-from typing import Any, Protocol, TypeAlias
+from typing import Protocol, TypeAlias
 
 from .config import TelegramConfigError, load_telegram_config
 from .telegram_client import TelegramClient, TelegramError
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
 CSV_COLUMNS = (
     "offer_id",
     "product_id",
@@ -227,10 +226,7 @@ def _summary_header(rows: Sequence[ProductRow]) -> str:
 
 
 def _row_stock(row: ProductRow) -> int | None:
-    try:
-        return parse_stock(row.get("stock", ""))
-    except Task2CSVError:
-        raise
+    return parse_stock(row.get("stock", ""))
 
 
 def _product_counts(

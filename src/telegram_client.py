@@ -123,6 +123,8 @@ class TelegramClient:
         self,
         text: str,
     ) -> list[tuple[logging.Logger, _DependencyLogRedactor]]:
+        # Telegram embeds its bot token in the URL path; httpx/httpcore debug logs
+        # can render request URLs, so their records need request-scoped redaction.
         secrets = tuple(
             dict.fromkeys(
                 value

@@ -277,6 +277,33 @@ def test_network_failure_retries_without_token_in_error_or_logs(
     assert error.value.__context__ is None
 
 
+def test_request_log_redactors_are_removed_after_failure_and_sequential_clients(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    loggers = [
+        logging.getLogger(name)
+        for name in TelegramClient._dependency_logger_names()
+    ]
+    original_filters = {logger: list(logger.filters) for logger in loggers}
+
+    def fail(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(401, json={"ok": False, "error_code": 401})
+
+    with make_client(fail) as client, pytest.raises(TelegramHTTPError):
+        client.send_message("first outbound message")
+
+    assert {logger: list(logger.filters) for logger in loggers} == original_filters
+
+    def succeed(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"ok": True})
+
+    with caplog.at_level(logging.INFO, logger="httpx"):
+        with make_client(succeed) as client:
+            client.send_message("second outbound message")
+
+    assert {logger: list(logger.filters) for logger in loggers} == original_filters
+
+
 @pytest.mark.parametrize(
     ("token", "chat_id", "threshold", "message"),
     [
@@ -325,3 +352,20 @@ def test_telegram_config_trims_values_and_defaults_threshold(
         chat_id="chat-value",
         low_stock_threshold=5,
     )
+
+
+def test_invalid_threshold_does_not_retain_its_raw_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_threshold = "TELEGRAM_THRESHOLD_SUPER_SECRET"
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123456:TELEGRAM_SUPER_SECRET")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "TEST_CHAT_ID_SECRET")
+    monkeypatch.setenv("LOW_STOCK_THRESHOLD", fake_threshold)
+
+    with pytest.raises(TelegramConfigError) as raised:
+        load_telegram_config(MISSING_DOTENV_PATH)
+
+    assert fake_threshold not in str(raised.value)
+    assert fake_threshold not in repr(raised.value)
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None

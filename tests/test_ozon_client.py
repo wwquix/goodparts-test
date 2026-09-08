@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -13,9 +14,11 @@ from src.ozon_client import (
     INFO_BATCH_SIZE,
     MAX_ATTEMPTS,
     OzonClient,
+    OzonError,
     OzonHTTPError,
     OzonResponseError,
     PRODUCT_PAGE_LIMIT,
+    SAFE_RESPONSE_EXCERPT_LENGTH,
 )
 
 
@@ -93,6 +96,11 @@ def test_product_pagination_uses_nonempty_last_id_even_for_short_page() -> None:
                     }
                 },
             )
+        if len(requests) == 2:
+            return httpx.Response(
+                200,
+                json={"result": {"items": [], "total": 1, "last_id": "NEXT"}},
+            )
         return httpx.Response(
             200,
             json={"result": {"items": [], "total": 1, "last_id": ""}},
@@ -102,7 +110,7 @@ def test_product_pagination_uses_nonempty_last_id_even_for_short_page() -> None:
         products = client.list_all_products()
 
     assert products == [{"product_id": 1, "offer_id": "A", "archived": False}]
-    assert len(requests) == 2
+    assert len(requests) == 3
     assert requests[0] == {
         "filter": {"visibility": "ALL"},
         "limit": PRODUCT_PAGE_LIMIT,
@@ -112,6 +120,7 @@ def test_product_pagination_uses_nonempty_last_id_even_for_short_page() -> None:
         "last_id": "TOKEN",
         "limit": PRODUCT_PAGE_LIMIT,
     }
+    assert requests[2]["last_id"] == "NEXT"
 
 
 def test_product_info_batches_1001_offer_ids() -> None:
@@ -167,15 +176,21 @@ def test_cursor_pagination_uses_exact_token(
                 200,
                 json={"items": [first_item], "cursor": "NEXT", "total": 1},
             )
+        if len(requests) == 2:
+            return httpx.Response(
+                200,
+                json={"items": [], "cursor": "LAST", "total": 1},
+            )
         return httpx.Response(200, json={"items": [], "cursor": "", "total": 1})
 
     with make_client(handler) as client:
         items = getattr(client, method_name)()
 
     assert items == [first_item]
-    assert [path for path, _ in requests] == [endpoint, endpoint]
+    assert [path for path, _ in requests] == [endpoint, endpoint, endpoint]
     assert requests[0][1]["cursor"] == ""
     assert requests[1][1]["cursor"] == "NEXT"
+    assert requests[2][1]["cursor"] == "LAST"
 
 
 def test_retries_500_then_succeeds() -> None:
@@ -232,6 +247,31 @@ def test_401_is_not_retried_and_secrets_are_redacted() -> None:
     assert "client-value" not in str(error.value)
     assert "api-secret-value" not in str(error.value)
     assert str(error.value).count("[REDACTED]") == 2
+
+
+def test_http_error_redacts_complete_body_before_truncating_at_cutoff(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    fake_secret = "OZON_TEST_CUTOFF_SECRET"
+    body = "x" * (SAFE_RESPONSE_EXCERPT_LENGTH - 3) + fake_secret + "y" * 1000
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(401, text=body)
+
+    with caplog.at_level(logging.INFO, logger="httpx"):
+        with OzonClient(
+            OzonConfig(client_id="test-client", api_key=fake_secret),
+            transport=httpx.MockTransport(handler),
+        ) as client, pytest.raises(OzonHTTPError) as error:
+            client.list_all_prices()
+
+    excerpt = str(error.value).split("response=", maxsplit=1)[1]
+    assert len(excerpt) <= SAFE_RESPONSE_EXCERPT_LENGTH
+    assert fake_secret not in str(error.value)
+    assert fake_secret[:3] not in str(error.value)
+    assert fake_secret[3:] not in str(error.value)
+    assert fake_secret not in repr(error.value)
+    assert fake_secret not in caplog.text
 
 
 def test_exhausted_500_retries_are_bounded() -> None:
@@ -292,6 +332,22 @@ def test_price_cursor_schema_error_is_explicit() -> None:
             "last_id",
         ),
         (
+            "list_all_prices",
+            {
+                "items": [
+                    {"product_id": 1, "offer_id": "A", "price": {"price": 1}}
+                ],
+                "cursor": "SAME",
+            },
+            {
+                "items": [
+                    {"product_id": 2, "offer_id": "B", "price": {"price": 2}}
+                ],
+                "cursor": "SAME",
+            },
+            "cursor",
+        ),
+        (
             "list_all_stocks",
             {
                 "items": [
@@ -329,3 +385,84 @@ def test_repeated_continuation_token_with_items_fails(
 
     assert len(requests) == 2
     assert requests[1][continuation_key] == "SAME"
+
+
+@pytest.mark.parametrize(
+    ("method_name", "payloads"),
+    [
+        (
+            "list_all_products",
+            [
+                {"result": {"items": [], "last_id": "A"}},
+                {"result": {"items": [], "last_id": "B"}},
+                {"result": {"items": [], "last_id": "A"}},
+            ],
+        ),
+        (
+            "list_all_prices",
+            [
+                {"items": [], "cursor": "A"},
+                {"items": [], "cursor": "B"},
+                {"items": [], "cursor": "A"},
+            ],
+        ),
+    ],
+)
+def test_continuation_token_long_cycle_fails(
+    method_name: str,
+    payloads: list[dict[str, Any]],
+) -> None:
+    requests: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request_json(request))
+        return httpx.Response(200, json=payloads[len(requests) - 1])
+
+    with make_client(handler) as client, pytest.raises(
+        OzonResponseError, match="same non-empty continuation token"
+    ):
+        getattr(client, method_name)()
+
+    assert len(requests) == 3
+
+
+def test_invalid_json_does_not_retain_transport_exception_or_fake_secret(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    fake_secret = "OZON_TEST_SUPER_SECRET"
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text=f"not-json {fake_secret}")
+
+    with caplog.at_level(logging.INFO, logger="httpx"):
+        with make_client(handler) as client, pytest.raises(OzonResponseError) as error:
+            client.list_all_prices()
+
+    assert fake_secret not in str(error.value)
+    assert fake_secret not in repr(error.value)
+    assert fake_secret not in caplog.text
+    assert error.value.__cause__ is None
+    assert error.value.__context__ is None
+
+
+def test_final_network_error_does_not_retain_transport_exception_or_fake_secret(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    fake_secret = "OZON_TEST_SUPER_SECRET"
+    attempts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        raise httpx.ConnectError(f"network detail {fake_secret}", request=request)
+
+    with caplog.at_level(logging.INFO, logger="httpx"):
+        with make_client(handler) as client, pytest.raises(OzonError) as error:
+            client.list_all_prices()
+
+    assert attempts == MAX_ATTEMPTS
+    assert fake_secret not in str(error.value)
+    assert fake_secret not in repr(error.value)
+    assert fake_secret not in caplog.text
+    assert error.value.__cause__ is None
+    assert error.value.__context__ is None

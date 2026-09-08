@@ -9,7 +9,7 @@ import tempfile
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from decimal import Decimal, InvalidOperation
+from decimal import ROUND_HALF_EVEN, Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Protocol, TypeAlias
 
@@ -232,7 +232,12 @@ def _normalize_price(
 
     try:
         if currency == "RUB":
-            normalized_price = format(amount.quantize(Decimal("0.01")), ".2f")
+            # The Task 1 CSV serializes price.price as RUB cents; make Decimal's
+            # existing half-even behavior explicit for unexpected extra precision.
+            normalized_price = format(
+                amount.quantize(Decimal("0.01"), rounding=ROUND_HALF_EVEN),
+                ".2f",
+            )
         else:
             normalized_price = format(amount, "f")
     except InvalidOperation:
@@ -252,6 +257,8 @@ def _normalize_stock(stock_item: JsonObject, *, product_id: int) -> int:
             f"for product_id={product_id}"
         )
 
+    # Project business interpretation of available stock, not a universal Ozon
+    # field: sum each warehouse's non-negative present-minus-reserved.
     available = 0
     for index, record in enumerate(stock_records):
         if not isinstance(record, dict):

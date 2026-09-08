@@ -80,13 +80,17 @@ def run_daily(
     summary_sender: SummarySender = send_summary,
 ) -> DailyRunResult:
     """Export Ozon products, then send a summary for exactly that CSV path."""
+    ozon_failure: DailyRunError | None = None
     try:
         ozon_config = load_ozon()
         with ozon_client_factory(ozon_config) as ozon_client:
             export_result = exporter(ozon_client)
     except Exception as error:
-        raise DailyRunError("Ozon export", _safe_detail(error)) from error
+        ozon_failure = DailyRunError("Ozon export", _safe_detail(error))
+    if ozon_failure is not None:
+        raise ozon_failure
 
+    telegram_failure: DailyRunError | None = None
     try:
         telegram_config = load_telegram()
         with telegram_client_factory(telegram_config) as telegram_client:
@@ -96,11 +100,13 @@ def run_daily(
                 telegram_config.low_stock_threshold,
             )
     except Exception as error:
-        raise DailyRunError(
+        telegram_failure = DailyRunError(
             "Telegram summary",
             _safe_detail(error),
             export_result=export_result,
-        ) from error
+        )
+    if telegram_failure is not None:
+        raise telegram_failure
 
     return DailyRunResult(export=export_result, summary=summary_result)
 

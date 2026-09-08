@@ -132,6 +132,29 @@ def test_oversized_name_is_truncated_but_fixed_fields_are_retained() -> None:
     assert "…" in block
 
 
+def test_non_bmp_cyrillic_long_names_keep_each_product_once_within_limit() -> None:
+    rows = [
+        row(
+            offer_id=f"UNICODE-{index}",
+            name="Товар 🚀 " * 2000,
+            price=f"{index + 1}.00",
+            stock=str(index + 1),
+        )
+        for index in range(3)
+    ]
+
+    chunks = build_summary_chunks(rows, 5)
+
+    assert all(len(chunk) <= MAX_MESSAGE_CHARS for chunk in chunks)
+    for product in rows:
+        marker = f"Артикул: {product['offer_id']}"
+        assert sum(chunk.count(marker) for chunk in chunks) == 1
+        price_line = f"Цена: {product['price']} {product['currency']}"
+        assert sum(chunk.count(price_line) for chunk in chunks) == 1
+        stock_line = f"Остаток: {product['stock']} — ЗАКАНЧИВАЕТСЯ"
+        assert sum(chunk.count(stock_line) for chunk in chunks) == 1
+
+
 def test_read_csv_rejects_missing_column_invalid_stock_and_empty_file(
     temp_dir: Path,
 ) -> None:
@@ -181,6 +204,27 @@ def test_read_csv_rejects_extra_and_reordered_columns(temp_dir: Path) -> None:
     write_csv(reordered_path, [row()], columns=reordered_columns)
     with pytest.raises(Task2CSVError, match="reordered"):
         read_export_csv(reordered_path)
+
+
+def test_read_csv_rejects_duplicate_headers_and_excess_values(temp_dir: Path) -> None:
+    duplicate_header_path = temp_dir / "duplicate-header.csv"
+    duplicate_header_path.write_text(
+        ",".join((*CSV_COLUMNS, "offer_id"))
+        + "\n"
+        + ",".join("x" for _ in range(8))
+        + "\n",
+        encoding="utf-8-sig",
+    )
+    with pytest.raises(Task2CSVError, match=r"duplicate column\(s\): offer_id"):
+        read_export_csv(duplicate_header_path)
+
+    excess_values_path = temp_dir / "excess-values.csv"
+    excess_values_path.write_text(
+        ",".join(CSV_COLUMNS) + "\n" + ",".join("x" for _ in range(8)) + "\n",
+        encoding="utf-8-sig",
+    )
+    with pytest.raises(Task2CSVError, match="more values than its header"):
+        read_export_csv(excess_values_path)
 
 
 def test_headers_only_and_utf8_sig_are_supported(temp_dir: Path) -> None:

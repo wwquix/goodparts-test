@@ -266,6 +266,36 @@ def test_invalid_price_keeps_product_with_empty_price(output_dir: Path) -> None:
 
 
 @pytest.mark.parametrize(
+    ("raw_price", "expected_price", "missing_price"),
+    [
+        (0, "0.00", False),
+        (1000, "1000.00", False),
+        ("1000.50", "1000.50", False),
+        ("1.225", "1.22", False),
+        (-1, "", True),
+        ("NaN", "", True),
+        ("Infinity", "", True),
+    ],
+)
+def test_price_price_serialization_is_safe_and_has_explicit_rub_precision(
+    output_dir: Path,
+    raw_price: object,
+    expected_price: str,
+    missing_price: bool,
+) -> None:
+    price = _price()
+    price["price"]["price"] = raw_price
+
+    result = export_ozon_products(
+        FakeOzonClient(prices=[price]), output_dir, now=lambda: FIXED_NOW
+    )
+
+    _, rows = _read_csv(result.path)
+    assert rows[0]["price"] == expected_price
+    assert result.missing_prices == int(missing_price)
+
+
+@pytest.mark.parametrize(
     "record",
     [
         {"present": -1, "reserved": 0},

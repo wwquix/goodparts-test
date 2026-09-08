@@ -35,6 +35,9 @@ KNOWN_BRANDS = (
     "ELRING",
 )
 
+# This controlled representative fixture defines these constrained patterns; it
+# is not employer data or a universal auto-parts parser.
+
 _QUANTITY_PATTERN = re.compile(
     r"(?:"
     r"(?P<units>\d+)\s*шт\.?"
@@ -274,8 +277,8 @@ def clean_catalog(
             removed_empty += 1
             continue
 
-        # Duplicates are exact only: do not make whitespace/case/format variants
-        # disappear merely because their cleaned display values happen to match.
+        # Duplicates are exact only: conflicting same-OEM rows have no authoritative
+        # winner, so display-equivalent whitespace/case variants must remain too.
         exact_key = (raw_description, raw_price)
         if exact_key in seen:
             removed_exact_duplicates += 1

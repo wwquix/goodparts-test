@@ -36,7 +36,7 @@ and uncommitted.
 From a clean Windows checkout:
 
 ```powershell
-py -3.12 -m venv .venv
+py -3 -m venv .venv
 .venv\Scripts\Activate.ps1
 python -m pip install -e ".[test]"
 Copy-Item .env.example .env
@@ -101,16 +101,16 @@ raw-field duplicates are removed; conflicts remain and ambiguity is missing.
 ## Tests
 
 ```powershell
-.venv\Scripts\python.exe -m pytest
-.venv\Scripts\python.exe -m compileall -q src scripts tests
-.venv\Scripts\python.exe -m pip check
+python -m pytest
+python -m compileall src scripts
+python -m pip check
 ```
 
 The daily-pipeline tests use fakes only. They cover the exact current-path
 handoff, stage isolation/failures, stale CSV regression, and a real Task 1 CSV
 plus real Task 2 parsing/chunking with fake Ozon/Telegram boundaries.
 
-## Data and edge-case decisions
+## Engineering decisions
 
 Task 1 fails on contradictory IDs rather than silently merging them. Missing
 secondary data remains empty in the CSV. Task 2 retains empty stock as unknown.

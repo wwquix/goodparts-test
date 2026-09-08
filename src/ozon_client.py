@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import logging
 import random
 import time
@@ -17,7 +16,8 @@ from .config import OzonConfig
 BASE_URL = "https://api-seller.ozon.ru"
 REQUEST_TIMEOUT_SECONDS = 20.0
 
-# Operational limits chosen for this client; they are not business semantics.
+# Configured operational page and batch limits; they are not claims that every
+# Ozon API method is permanently capped at 1000.
 PRODUCT_PAGE_LIMIT = 1000
 PRICE_PAGE_LIMIT = 1000
 STOCK_PAGE_LIMIT = 1000
@@ -33,6 +33,7 @@ JsonObject: TypeAlias = dict[str, Any]
 Sleep: TypeAlias = Callable[[float], None]
 
 logger = logging.getLogger(__name__)
+_INVALID_JSON = object()
 
 
 class OzonError(RuntimeError):
@@ -96,8 +97,7 @@ class OzonClient:
         return redacted
 
     def _response_excerpt(self, response: httpx.Response) -> str:
-        excerpt = response.text[:SAFE_RESPONSE_EXCERPT_LENGTH]
-        return self._redact(excerpt)
+        return self._redact(response.text)[:SAFE_RESPONSE_EXCERPT_LENGTH]
 
     @staticmethod
     def _retry_after_seconds(response: httpx.Response) -> float | None:
@@ -119,15 +119,14 @@ class OzonClient:
         )
 
     def _request(self, endpoint: str, json_body: JsonObject) -> JsonObject:
+        final_network_error: str | None = None
         for attempt in range(1, MAX_ATTEMPTS + 1):
             try:
                 response = self._client.post(endpoint, json=json_body)
             except (httpx.TimeoutException, httpx.RequestError) as exc:
                 if attempt == MAX_ATTEMPTS:
-                    raise OzonError(
-                        f"Ozon request failed after {MAX_ATTEMPTS} attempts: "
-                        f"endpoint={endpoint}, error={type(exc).__name__}"
-                    ) from exc
+                    final_network_error = type(exc).__name__
+                    break
                 delay = self._backoff_seconds(attempt)
                 logger.warning(
                     "Ozon request retry: endpoint=%s attempt=%d error=%s delay=%.2fs",
@@ -165,16 +164,23 @@ class OzonClient:
 
             try:
                 payload = response.json()
-            except json.JSONDecodeError as exc:
+            except ValueError:
+                payload = _INVALID_JSON
+            if payload is _INVALID_JSON:
                 raise OzonResponseError(
                     f"Unexpected response from {endpoint}: body is not valid JSON"
-                ) from exc
+                )
             if not isinstance(payload, dict):
                 raise OzonResponseError(
                     f"Unexpected response from {endpoint}: top level must be an object"
                 )
             return payload
 
+        if final_network_error is not None:
+            raise OzonError(
+                f"Ozon request failed after {MAX_ATTEMPTS} attempts: "
+                f"endpoint={endpoint}, error={final_network_error}"
+            )
         raise AssertionError("Retry loop exited unexpectedly")
 
     @staticmethod
@@ -225,6 +231,8 @@ class OzonClient:
         seen_tokens: set[str],
         endpoint: str,
     ) -> None:
+        # Tokens are opaque: a live diagnostic returned one after a short page, so
+        # only empty terminates; a seen non-empty token is a cycle/broken progress.
         if token in seen_tokens:
             raise OzonResponseError(
                 f"Pagination repeated a continuation token for {endpoint}: "

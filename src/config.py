@@ -83,11 +83,9 @@ def load_telegram_config(
     raw_threshold = os.getenv("LOW_STOCK_THRESHOLD", "5").strip()
     try:
         threshold = int(raw_threshold)
-    except ValueError as exc:
-        raise TelegramConfigError(
-            "LOW_STOCK_THRESHOLD must be an integer >= 0"
-        ) from exc
-    if threshold < 0:
+    except ValueError:
+        threshold = None
+    if threshold is None or threshold < 0:
         raise TelegramConfigError("LOW_STOCK_THRESHOLD must be an integer >= 0")
 
     return TelegramConfig(
