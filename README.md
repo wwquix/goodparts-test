@@ -1,140 +1,187 @@
-# GoodParts test assignment
+ Как я работал с документацией и ИИ
 
-This repository has three deliberately separate workflows: an Ozon product
-export, a Telegram low-stock summary, and an offline employer-catalog cleaner.
-The daily command composes Tasks 1 and 2 only.
+ Зачем использовал ИИ
 
-## What it does
+ИИ использовался как вспомогательный инструмент, а не как источник истины.
 
-- Task 1 reads Ozon Seller data and atomically writes a UTF-8-SIG product CSV.
-- Task 2 reads one explicit Task 1 CSV and sends a Russian plain-text Telegram
-  summary.
-- `python -m src.run_daily` gives Task 2 the exact Task 1 output path.
-- Task 3 cleans the employer-provided `data/catalog_raw.csv`; it is not part of
-  the daily pipeline.
+С его помощью я:
 
-## Architecture
+- обсуждал архитектуру решения;
+- проверял технические гипотезы;
+- искал потенциальные крайние случаи;
+- генерировал идеи для regression/unit-тестов;
+- проводил code review и adversarial review готового решения.
 
-```text
-Ozon /v3/product/list ─┐
-Ozon /v3/product/info/list ─┼─> strict product_id merge ─> atomic CSV ─> Telegram summary
-Ozon /v5/product/info/prices ─┤                                  │
-Ozon /v4/product/info/stocks ─┘                                  └─ explicit returned path
+Моделям передавались:
 
-catalog_raw.csv ─> data-first cleaner ─> catalog_clean.csv        (separate Task 3 ETL)
-```
+- текст тестового задания;
+- требования к каждому этапу;
+- предполагаемая архитектура;
+- названия и назначение методов Ozon Seller API;
+- структура фактических API-ответов;
+- результаты диагностических read-only запросов;
+- структура и отдельные примеры строк `catalog_raw.csv`;
+- ошибки и результаты тестов, которые требовалось проанализировать.
 
-## Setup
+Исходное задание содержало тестовые доступы Ozon. После получения задания
+credentials не использовались как часть рабочих промптов, не добавлялись в код,
+тесты, README или сохраняемые диагностические артефакты. Все рабочие секреты
+хранились только в локальном `.env`.
 
-Python 3.12 or newer is required. Ozon credentials are required for Task 1;
-Telegram credentials are required for Task 2. Generated runtime files and
-`.env` remain ignored.
+### Как формулировались запросы к ИИ
 
-```powershell
-py -3 -m venv .venv
-.venv\Scripts\Activate.ps1
-python -m pip install -e ".[test]"
-Copy-Item .env.example .env
-```
+В запросах я просил модель явно разделять:
 
-Edit only the local `.env`; never commit it. The only variable names used are
-`OZON_CLIENT_ID`, `OZON_API_KEY`, `TELEGRAM_BOT_TOKEN`,
-`TELEGRAM_CHAT_ID`, and `LOW_STOCK_THRESHOLD`.
+1. подтверждённые факты о работе API;
+2. инженерные решения проекта;
+3. предположения, которые ещё требуют проверки.
 
-## Tasks 1 and 2
+Также отдельно указывалось:
 
-Run `python -m src.task1_export`. The canonical product set is
-`/v3/product/list`; its opaque pagination token is forwarded without changing
-it, archived items are excluded, and `/v3/product/info/list` requests are
-batched. Sources are merged by `product_id`. Prices come from
-`/v5/product/info/prices` (`price.price`), and stock is
-`sum(max(present-reserved, 0))`. The UTF-8-SIG export contains article
-(`offer_id`), name, current price, stock, and one UTC export date, then is
-published with atomic `os.replace`.
+- не придумывать поля API-ответов;
+- не считать предполагаемый endpoint или response path подтверждённым без проверки;
+- отмечать сомнительные или устаревшие API assumptions;
+- для очистки каталога сначала исследовать реальные данные и только после этого
+  предлагать regex и правила нормализации;
+- при неоднозначных данных предпочитать пропущенное значение выдуманному.
 
-The client has bounded HTTP/network handling and bounded 429 retries using
-`Retry-After` when supplied or backoff otherwise. Its safe logs redact values
-loaded from local `.env`; neither request credentials nor response bodies are
-written to the tracked submission.
+Например, вместо запроса «напиши клиент Ozon API» задача формулировалась ближе
+к следующему виду:
 
-Run `python -m src.task2_summary data/output/ozon_products_YYYY-MM-DD.csv`
-with an explicit export. It sends via the Telegram Bot API using the local bot
-token and chat ID from `.env`. Low stock means
-`stock < LOW_STOCK_THRESHOLD`; an empty stock is unknown, not zero, and the
-summary marks qualifying items with exact text `ЗАКАНЧИВАЕТСЯ`.
-`python -m src.run_daily` runs Task 1 before initializing Task 2 and passes the
-returned path directly.
+> Проверь предполагаемую схему по реальным ответам. Отдельно перечисли
+> подтверждённые поля, инженерные решения и предположения. Не используй
+> неподтверждённые response paths в production-коде.
 
-For a separate read-only API inspection, run
-`python scripts/diagnose_ozon.py`. A successful diagnostic keeps its actual
-response JSON only in ignored paths under `data/diagnostics/`, including
-`product_list_page_1.json`, `product_list_page_2.json`, `product_info.json`,
-`product_prices.json`, and `product_stocks.json` when those calls occur.
+Для Task 3 подход был похожим:
 
-## Task 3
+> Сначала профилируй реальный CSV, перечисли встречающиеся форматы и
+> неоднозначности, затем предложи минимальные правила парсинга только для
+> реально обнаруженных случаев.
 
-Run `python -m src.task3_clean data/catalog_raw.csv`. The tracked input is the
-employer-provided UTF-8-SIG CSV with `offer_id,name,price,stock`; it is not a
-synthetic fixture. The output retains those fields and adds `brand,oem,quantity`.
+### Как проверялись ответы ИИ
 
-The cleaner accepts only price forms observed in this file (spaces or comma/dot
-decimals, `руб`/`р`/`rub`, and `от 450 руб`); `Decimal` produces two decimal
-places. `от` is a lower-bound qualifier that the required output schema cannot
-retain, so its numeric lower bound is emitted and the ambiguity is documented.
-Brands are only Mavico (case variants), DBA, and Деталиус. OEM is only an
-explicit `OEM` followed by the observed 10-digit or `4-7`-digit shape. Quantity
-is only terminal numeric `шт`, explicit numeric комплект/компл/к-т, `набор N
-шт`, or `пара` (=2); bare комплекты and dimensions remain empty.
+Ответ модели сам по себе не считался подтверждением.
 
-Fully blank source rows and exact raw duplicates are removed. Business
-duplicates are merged only for a non-empty normalized `offer_id` whose parsed
-non-empty prices agree and whose non-empty stocks agree; the first name/order
-is retained and a missing first stock may be filled from that compatible group.
-Price or stock conflicts, missing IDs, and uncertain derived values remain
-separate or empty.
+Для проверки использовались:
 
-## Submission artifacts
+- документация Ozon Seller API;
+- changelog Ozon API;
+- read-only диагностические запросы к предоставленному тестовому кабинету;
+- фактические JSON-ответы API;
+- regression/unit-тесты;
+- повторный review после исправлений.
 
-- `catalog_clean.csv`: verified Task 3 output, UTF-8-SIG, with
-  `offer_id,name,price,stock,brand,oem,quantity`.
-- `ozon_products_result.csv`: verified Task 1 export copy, UTF-8-SIG, with
-  `offer_id,product_id,name,price,currency,stock,exported_at`.
+Хороший пример такой проверки — получение данных о товаре.
 
-## Tests
+Изначально `/v3/product/info/list` рассматривался как возможный источник всех
+необходимых данных. Эту гипотезу я не стал принимать только потому, что её
+предложил ИИ.
 
-```powershell
-python -m pytest
-python -m compileall -q src scripts tests
-python -m pip check
-```
+После проверки реальных API-ответов production-реализация использует отдельные
+актуальные методы:
 
-Task 3 regression tests cover every observed price syntax, the three brands,
-OEM and quantity positives/false positives, blank and exact rows, compatible
-and conflicting business duplicates, missing IDs, atomic failures, CLI output,
-and the real input's 19-to-12 result. The Task 1/2 tests use fakes at the
-network boundaries.
+- `/v5/product/info/prices` — для цены;
+- `/v4/product/info/stocks` — для остатков.
 
-## AI usage and verification
+Ещё один пример — пагинация. На реальном API короткая страница могла вернуть
+непустой `last_id`, поэтому завершать обход по условию `len(items) < limit`
+нельзя. Пагинация продолжается по возвращённому `last_id`/`cursor` до пустого
+continuation token.
 
-AI was supplied the assignment, existing architecture, relevant official Ozon
-API documentation/changelog excerpts, safe response-shape and diagnostic
-summaries, plus the Task 3 schema/profile and representative rows. Prompts
-separated confirmed facts, engineering decisions, and assumptions. Possible
-hallucinated or outdated API claims were checked against official Ozon
-documentation and changelog, live read-only diagnostics when performed and
-their actual ignored response JSON paths, and regression tests. No raw
-diagnostic JSON was run for this submission pass; the single live check was the
-read-only Task 1 export described below.
-In particular, the earlier assumption that `/v3/product/info/list` alone
-provided all export data was corrected: product information remains there, while
-prices and stocks use `/v5/product/info/prices` and `/v4/product/info/stocks`.
+### Дополнительная проверка другими ИИ-моделями
 
-A single live read-only Task 1 export was run on 2026-09-08 and its returned
-CSV path was validated before producing the root submission copy. A live
-Telegram smoke was not executed because Telegram credentials are absent. No
-credential values or raw diagnostic responses are included in this repository.
+Критичные решения дополнительно проверялись через другие ИИ-модели как
+независимый second opinion.
 
-## Limitations
+Они использовались не для автоматического принятия решения, а для поиска:
 
-Not implemented: an external scheduler, monitoring/alerts, persistent history,
-or a Telegram send without configured credentials.
+- неверных предположений об API;
+- потенциальных ошибок пагинации;
+- проблем с retry и HTTP 429;
+- ошибок нормализации цены и остатков;
+- ложных срабатываний parser-а Task 3;
+- возможных утечек credentials через exceptions и logging;
+- неучтённых edge cases.
+
+Если выводы моделей расходились, окончательное решение принималось по
+первичным источникам: документации, changelog, реальным API-ответам и тестам.
+
+Таким образом несколько моделей использовались скорее как независимые
+ревьюеры, а не как замена документации или фактической проверки.
+
+## Task 3: крайние случаи и неоднозначные данные
+
+Перед написанием правил очистки сначала был исследован предоставленный
+`catalog_raw.csv`.
+
+В исходных данных встретились:
+
+- цены с пробелами;
+- цены с точкой и запятой;
+- суффиксы `руб`, `р`, `rub`;
+- значение `от 450 руб`;
+- одна строка без цены;
+- одна строка без `offer_id`;
+- количество в форматах `шт`, `комплект`, `набор`, `пара`;
+- `комплект` без явного числового количества;
+- размеры вида `600мм/400мм`, которые нельзя принимать за количество;
+- несколько записей одного `offer_id`;
+- строки, которые можно безопасно объединить;
+- потенциально конфликтующие записи, для которых нет надёжного правила выбора.
+
+`от 450 руб` интерпретируется как указанная нижняя граница цены `450.00`, что
+явно задокументировано как принятое инженерное решение.
+
+Главный принцип при очистке — не угадывать неоднозначные значения.
+
+Дубли объединяются только когда идентификатор совпадает, нормализованные цены
+не противоречат друг другу и данные об остатках совместимы. Конфликтующие
+записи или строки без надёжного идентификатора не объединяются автоматически.
+
+## Результаты задания
+
+### Task 1 — реальная выгрузка Ozon
+
+Был выполнен реальный read-only запуск Task 1 с предоставленным тестовым
+кабинетом Ozon.
+
+Результат сохранён в:
+
+`ozon_products_result.csv`
+
+Файл содержит:
+
+- `offer_id`
+- `product_id`
+- `name`
+- `price`
+- `currency`
+- `stock`
+- `exported_at`
+
+Credentials и другие секреты в файл не записываются.
+
+### Task 3 — очищенный каталог
+
+Результат обработки предоставленного `catalog_raw.csv` сохранён в:
+
+`catalog_clean.csv`
+
+Финальная схема:
+
+`offer_id,name,price,stock,brand,oem,quantity`
+
+Исходный файл работодателя также сохранён в:
+
+`data/catalog_raw.csv`
+
+### Telegram
+
+Логика формирования сообщений, low-stock threshold, chunking, retries и
+обработка ошибок Telegram покрыты автоматическими тестами.
+
+"оформил с ии"
+
+Реальная отправка в Telegram в финальном checkout не выполнялась, поскольку
+локальные `TELEGRAM_BOT_TOKEN` и `TELEGRAM_CHAT_ID` не были настроены.
+Успешная live-отправка поэтому в README не заявляется.
