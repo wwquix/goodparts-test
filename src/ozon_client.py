@@ -222,23 +222,21 @@ class OzonClient:
     @staticmethod
     def _guard_continuation_progress(
         token: str,
-        collected_count: int,
-        seen_tokens: dict[str, int],
+        seen_tokens: set[str],
         endpoint: str,
     ) -> None:
-        previous_count = seen_tokens.get(token)
-        if previous_count == collected_count:
+        if token in seen_tokens:
             raise OzonResponseError(
-                f"Pagination made no progress for {endpoint}: "
+                f"Pagination repeated a continuation token for {endpoint}: "
                 "the same non-empty continuation token was returned again"
             )
-        seen_tokens[token] = collected_count
+        seen_tokens.add(token)
 
     def list_all_products(self) -> list[JsonObject]:
         endpoint = "/v3/product/list"
         collected: list[JsonObject] = []
         last_id = ""
-        seen_tokens: dict[str, int] = {}
+        seen_tokens: set[str] = set()
         page_number = 1
 
         while True:
@@ -267,9 +265,7 @@ class OzonClient:
 
             if not next_last_id:
                 break
-            self._guard_continuation_progress(
-                next_last_id, len(collected), seen_tokens, endpoint
-            )
+            self._guard_continuation_progress(next_last_id, seen_tokens, endpoint)
             last_id = next_last_id
             page_number += 1
 
@@ -311,7 +307,7 @@ class OzonClient:
     ) -> list[JsonObject]:
         collected: list[JsonObject] = []
         cursor = ""
-        seen_tokens: dict[str, int] = {}
+        seen_tokens: set[str] = set()
         page_number = 1
 
         while True:
@@ -338,9 +334,7 @@ class OzonClient:
 
             if not next_cursor:
                 break
-            self._guard_continuation_progress(
-                next_cursor, len(collected), seen_tokens, endpoint
-            )
+            self._guard_continuation_progress(next_cursor, seen_tokens, endpoint)
             cursor = next_cursor
             page_number += 1
 

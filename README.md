@@ -1,151 +1,134 @@
 # GoodParts test assignment
 
-## Diagnostic setup
+This repository contains three deliberately separate, small workflows: an Ozon
+product export, a Telegram low-stock summary, and a controlled catalog-cleaning
+demo. The daily command composes only Tasks 1 and 2.
 
-Requires Python 3.12 or newer.
+## What it does
+
+- Task 1 reads Ozon Seller data and atomically writes a UTF-8-SIG product CSV.
+- Task 2 reads one explicit Task 1 CSV and sends a Russian plain-text Telegram
+  summary.
+- `python -m src.run_daily` runs Task 1, then gives Task 2 the exact returned
+  CSV path.
+- Task 3 is a separate, offline catalog-cleaning ETL; it is not imported or
+  run by the daily pipeline.
+
+## Architecture
+
+```text
+Ozon /v3/product/list ─┐
+Ozon /v3/product/info/list ─┼─> strict product_id merge ─> atomic CSV ─> Telegram summary
+Ozon /v5/product/info/prices ─┤                                  │
+Ozon /v4/product/info/stocks ─┘                                  └─ explicit returned path
+
+catalog_raw.csv ─> cleaning rules ─> catalog_clean.csv     (separate Task 3 ETL)
+```
+
+## Requirements
+
+Python 3.12 or newer, plus Ozon Seller credentials for Task 1 and Telegram
+credentials for Task 2. Generated files, diagnostics, and `.env` stay ignored
+and uncommitted.
+
+## Setup
+
+From a clean Windows checkout:
 
 ```powershell
 py -3.12 -m venv .venv
 .venv\Scripts\Activate.ps1
-python -m pip install -e .
+python -m pip install -e ".[test]"
 Copy-Item .env.example .env
 ```
 
-Open `.env` and manually add the real `OZON_CLIENT_ID` and `OZON_API_KEY` values.
-Do not commit this file.
+Edit the local `.env`; never commit it.
 
-Run Diagnostic v2 from the project root:
+## Environment variables
 
-```powershell
-python scripts/diagnose_ozon.py
-```
+Only these names are used:
 
-Diagnostic v2 checks the live, read-only Ozon Seller API responses for:
+- `OZON_CLIENT_ID`
+- `OZON_API_KEY`
+- `TELEGRAM_BOT_TOKEN`
+- `TELEGRAM_CHAT_ID`
+- `LOW_STOCK_THRESHOLD`
 
-- `/v3/product/list`, including a two-page pagination check with the exact
-  opaque `last_id` returned by page 1;
-- `/v3/product/info/list` for one real product from the list response;
-- `/v5/product/info/prices` for the same real product;
-- `/v4/product/info/stocks` for the same real product.
+## Task 1
 
-Complete pretty-printed raw JSON responses are saved locally in
-`data/diagnostics/`. The diagnostic does not normalize prices or aggregate stocks.
+Run `python -m src.task1_export`. The canonical product set is
+`/v3/product/list`; `archived=true` items are excluded. Product data is merged
+by `product_id`. Base price is `/v5/product/info/prices` → `price.price`.
+Stock is `sum(max(present-reserved, 0))`; `stocks=[]` is known zero and a missing
+stock item is unknown. The export uses one UTC timestamp, UTF-8-SIG, and atomic
+`os.replace` publication.
 
-## Production Ozon access layer
+### Diagnostic v2
 
-`src/config.py` loads and validates the two Ozon credentials. The synchronous
-`OzonClient` owns connection lifecycle, timeout and bounded transient retries,
-strict response validation, product pagination, product-info batching, and cursor
-pagination for raw price and stock items.
+Run `python scripts/diagnose_ozon.py` separately for read-only Task 1 API
+diagnosis. With valid Ozon credentials it writes ignored raw JSON artifacts;
+clean clones intentionally contain none.
 
-## Task 1: Ozon to CSV
+## Task 2
 
-Run the complete Task 1 pipeline from the project root:
+Run `python -m src.task2_summary data/output/ozon_products_YYYY-MM-DD.csv` for
+an explicit export. Low stock means `stock < threshold`; unknown is not zero.
+Messages are plain text, split into 4000-character chunks, wait about 1.05
+seconds only between multiple messages, and use bounded retries.
 
-```powershell
-python -m src.task1_export
-```
+## Daily pipeline
 
-The command takes `/v3/product/list` as the canonical product set, excludes
-items whose `archived` value is `true`, and merges product info, prices, and
-stocks strictly by `product_id`. Contradictory `offer_id` values and duplicate
-product IDs fail the export instead of being merged silently. A product missing
-from a secondary source remains in the CSV with the corresponding value empty.
-
-CSV files are written to `data/output/ozon_products_YYYY-MM-DD.csv` with these
-columns, in order:
-
-```text
-offer_id,product_id,name,price,currency,stock,exported_at
-```
-
-The encoding is UTF-8 with BOM (`utf-8-sig`) for Excel on Windows. One
-timezone-aware UTC timestamp is used for every row and the filename. The file is
-first completed in the same output directory and then published with an atomic
-replacement, so a successful second run on the same UTC date replaces the first
-file without exposing a partial CSV.
-
-### Price decision
-
-The CSV price is `/v5/product/info/prices` → `price.price`. Promotional fields
-such as `marketing_seller_price` are not used as the base price. RUB values are
-formatted to two decimal places without currency conversion. A missing or
-invalid price becomes an empty value and is reported as a warning.
-
-### Stock decision
-
-The CSV stock value is the project's business interpretation of available
-stock, not a universal Ozon field:
-
-```text
-sum(max(present - reserved, 0))
-```
-
-The sum covers all stock records returned by Ozon for the product. An existing
-stock item with `stocks=[]` means known zero stock (`0`). A completely missing
-stock item means unknown stock and is exported as an empty value. Malformed
-stock records fail the export.
-
-Install the test dependency and run the unit tests:
+Run:
 
 ```powershell
-python -m pip install -e ".[test]"
-python -m pytest
+python -m src.run_daily
 ```
 
-## Task 2: CSV summary to Telegram
+It loads Ozon configuration, creates and closes `OzonClient`, exports Task 1,
+then—and only after success—loads Telegram configuration, creates and closes
+`TelegramClient`, and calls Task 2 with `ExportResult.path`. It never searches
+for a CSV. A Task 1 failure never initializes Telegram. A Task 2 failure leaves
+the completed CSV in place and exits nonzero with a safe stage-specific error.
 
-Set `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, and optionally
-`LOW_STOCK_THRESHOLD` in the local, uncommitted `.env` file. Then send an
-explicit Task 1 export:
+## Task 3
+
+Run `python -m src.task3_clean data/catalog_raw.csv`. No original
+`catalog_raw.csv` was supplied; the tracked controlled representative fixture
+was created for the demo. Cleaning uses `Decimal`, fixture brands only, an
+explicit OEM marker, and terminal quantity patterns only. Blank rows and exact
+raw-field duplicates are removed; conflicts remain and ambiguity is missing.
+
+## Tests
 
 ```powershell
-python -m src.task2_summary data/output/ozon_products_2026-09-07.csv
+.venv\Scripts\python.exe -m pytest
+.venv\Scripts\python.exe -m compileall -q src scripts tests
+.venv\Scripts\python.exe -m pip check
 ```
 
-Task 2 reads only the UTF-8-SIG Task 1 CSV, keeps an empty stock value as an
-unknown remainder, builds Russian plain-text product blocks, and splits them at
-product boundaries under Telegram's 4000-character limit. Delivery is
-synchronous with bounded retries for transient Telegram responses. The command
-prints only safe delivery counters; it never prints the bot token or chat ID.
+The daily-pipeline tests use fakes only. They cover the exact current-path
+handoff, stage isolation/failures, stale CSV regression, and a real Task 1 CSV
+plus real Task 2 parsing/chunking with fake Ozon/Telegram boundaries.
 
-## Task 3: controlled catalog cleaning
+## Data and edge-case decisions
 
-Run the catalog cleaner from the project root:
+Task 1 fails on contradictory IDs rather than silently merging them. Missing
+secondary data remains empty in the CSV. Task 2 retains empty stock as unknown.
+Task 3 intentionally avoids business-record merging because conflicting prices
+have no authoritative winner.
 
-```powershell
-python -m src.task3_clean data/catalog_raw.csv
-```
+## AI usage and verification
 
-The input must be a UTF-8-SIG CSV with exactly these columns in this order:
+AI assisted with design review, hypotheses, test suggestions, and code review.
+A credentialed local diagnostic run produced five ignored JSON artifacts; clean
+clones intentionally do not contain them. The diagnostic showed that separate
+`/v5/product/info/prices` and `/v4/product/info/stocks` checks were needed after
+the initial `/v3/product/info/list` hypothesis; relevant Ozon API documentation
+and changelog were cross-checked. A full credentialed
+Ozon-to-Telegram end-to-end run was not executed in this checkout because
+Telegram credentials are absent; this README makes no fake success claim.
 
-```text
-description,price
-```
+## Limitations and production improvements
 
-The cleaner trims and makes description whitespace readable, removes only fully
-empty rows and exact source duplicates, then writes
-`data/output/catalog_clean.csv` atomically in UTF-8-SIG. It deliberately does
-not merge business duplicates: conflicting rows for the same OEM remain in the
-output. The output columns are:
-
-```text
-description,price,brand,oem,quantity
-```
-
-`1.500,50 руб` is the documented unambiguous European format and becomes
-`1500.50`. OEM is extracted only after an explicit `OEM` marker, uppercasing and
-removing spaces/dots while preserving hyphens and slashes. Quantity is extracted
-only from terminal `шт`, `pcs`, or `комплект` patterns; DOT values, oil grades,
-and liters are not quantities. Business deduplication remains disabled because
-conflicting prices have no authoritative winner.
-
-`data/catalog_raw.csv` is not an original GoodParts or employer-provided
-catalog. No original catalog fixture was included with this assignment; this
-small controlled representative fixture was created to demonstrate the
-requested cleaning pipeline and its documented edge cases.
-
-Diagnostic v2, the production Ozon access layer, Task 1 Ozon-to-CSV export,
-Task 2 CSV-to-Telegram delivery, and Task 3 controlled catalog cleaning are
-implemented. `run_daily`, scheduling, Docker, and a database remain
-intentionally out of scope.
+Not implemented: an external scheduler, structured monitoring, metrics/alerts,
+persistent history, and more integration coverage.

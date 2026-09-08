@@ -268,11 +268,64 @@ def test_price_cursor_schema_error_is_explicit() -> None:
         client.list_all_prices()
 
 
-def test_repeated_cursor_without_progress_fails() -> None:
-    def handler(_: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"items": [], "cursor": "SAME"})
+@pytest.mark.parametrize(
+    ("method_name", "first_payload", "second_payload", "continuation_key"),
+    [
+        (
+            "list_all_products",
+            {
+                "result": {
+                    "items": [
+                        {"product_id": 1, "offer_id": "A", "archived": False}
+                    ],
+                    "last_id": "SAME",
+                }
+            },
+            {
+                "result": {
+                    "items": [
+                        {"product_id": 2, "offer_id": "B", "archived": False}
+                    ],
+                    "last_id": "SAME",
+                }
+            },
+            "last_id",
+        ),
+        (
+            "list_all_stocks",
+            {
+                "items": [
+                    {"product_id": 1, "offer_id": "A", "stocks": []}
+                ],
+                "cursor": "SAME",
+            },
+            {
+                "items": [
+                    {"product_id": 2, "offer_id": "B", "stocks": []}
+                ],
+                "cursor": "SAME",
+            },
+            "cursor",
+        ),
+    ],
+)
+def test_repeated_continuation_token_with_items_fails(
+    method_name: str,
+    first_payload: dict[str, Any],
+    second_payload: dict[str, Any],
+    continuation_key: str,
+) -> None:
+    requests: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request_json(request))
+        payload = first_payload if len(requests) == 1 else second_payload
+        return httpx.Response(200, json=payload)
 
     with make_client(handler) as client, pytest.raises(
         OzonResponseError, match="same non-empty continuation token"
     ):
-        client.list_all_stocks()
+        getattr(client, method_name)()
+
+    assert len(requests) == 2
+    assert requests[1][continuation_key] == "SAME"
